@@ -1,7 +1,8 @@
 #!/usr/bin/python
 import ovirtsdk.api
 from ovirtsdk.xml import params
-from ovirtsdk.infrastructure import errors
+import os
+import fnmatch
 import sys
 import time
 import argparse
@@ -9,15 +10,13 @@ import ConfigParser
 import logging
 import subprocess
 from cpopen import CPopen
-import io
-import select
-import threading
-from StringIO import StringIO
-from weakref import proxy
+from contextlib import contextmanager
+import tempfile
 
 _georepScheduleCmd = ["/usr/bin/python", "/usr/share/glusterfs/scripts/schedule_georep.py"]
 _SNAPSHOT_NAME = "GLUSTER-Geo-rep-snapshot"
-
+SLAVE_MOUNT_LOG_FILE = ("/var/log/glusterfs/geo-replication"
+                          "/dr_slave.mount.log")
 
 class VMSnapshot():
     def getVM(self):
@@ -29,6 +28,53 @@ class VMSnapshot():
     def __init__(self, vm, snapshot):
        self.vm = vm
        self.snapshot = snapshot
+
+def findImgPaths(imgid, path):
+    pattern = imgid + '*'
+    for root, dirs, files in os.walk(path):
+        for filename in fnmatch.filter(files, pattern):
+            yield os.path.join(root, filename)
+
+def cleanup(hostname, volname, mnt):
+    """
+    Unmount the Volume and Remove the temporary directory
+    """
+    (ret, out, err) = execCmd(["umount", mnt])
+    if ret !=0:
+        logger.error("Unable to Unmount Gluster Volume "
+            "{0}:{1}(Mounted at {2})".format(hostname, volname, mnt))
+    (ret, out, err) = execCmd(["rmdir", mnt])
+    if ret !=0:
+        logger.error("Unable to Remove temp directory "
+            "{0}".format(mnt))
+
+
+@contextmanager
+def glustermount(hostname, volname):
+    """
+    Context manager for Mounting Gluster Volume
+    Use as
+        with glustermount(HOSTNAME, VOLNAME) as MNT:
+            # Do your stuff
+    Automatically unmounts it in case of Exceptions/out of context
+    """
+    mnt = tempfile.mkdtemp(prefix="drcleanup_")
+    logger.debug("MNT:" + mnt)
+    (ret, out, err) = execCmd(["/usr/sbin/glusterfs",
+                             "--volfile-server", hostname,
+                             "--volfile-id", volname,
+                             "-l", SLAVE_MOUNT_LOG_FILE,
+                             mnt])
+    if ret != 0:
+        logger.error("Unable to mount Gluster Volume "
+                     "{0}:{1} at {2}".format(hostname, volname, mnt))
+    if os.path.ismount(mnt):
+        yield mnt
+    else:
+        logger.info("Unable to Mount Gluster Volume "
+                     "{0}:{1}".format(hostname, volname))
+    cleanup(hostname, volname, mnt)
+
 
 def execCmd(command, cwd=None, data=None, raw=False,
             env=None, sync=True, deathSignal=0, childUmask=None):
@@ -45,7 +91,6 @@ def execCmd(command, cwd=None, data=None, raw=False,
 
     p = CPopen(command, close_fds=True, cwd=cwd, env=env,
                deathSignal=deathSignal, childUmask=childUmask)
-    # p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     (out, err) = p.communicate(data)
 
@@ -53,9 +98,9 @@ def execCmd(command, cwd=None, data=None, raw=False,
         # Prevent splitlines() from barfing later on
         out = ""
 
-    logger.info("%s: <err> = %s; <rc> = %d",
+    logger.debug("%s: <err> = %s; <rc> = %d",
                         {True: "SUCCESS", False: "FAILED"}[p.returncode == 0],
-                        repr(err), p.returncode)
+                 repr(err), p.returncode)
 
     if not raw:
         out = out.splitlines(False)
@@ -85,6 +130,16 @@ def parse_input():
     args = parser.parse_args()
     return args
 
+def wait_for_snapshot_deletion(vm, snapshotid):
+    while True:
+        snapshot = vm.snapshots.get(id=snapshotid)
+        if snapshot is not None:
+            logger.debug ("Snapshot status: " + snapshot.get_snapshot_status())
+            time.sleep(10)
+        else:
+            logger.error ("Snapshot deleted for VM: " + vm.name)
+            break
+
 def main(args):
     retcode = 0
     if (args.config):
@@ -94,14 +149,18 @@ def main(args):
         server = config.get('GENERAL', 'server')
         username = config.get('GENERAL', 'user_name')
         password = config.get('GENERAL', 'password')
+    if not server or not username or not password:
+        logger.error("Server credentials not provided")
+        sys.exit("Server credentials not provided")
 
     time_start = int(time.time())
     # Connect to server
     try:
         connect(server, username, password)
+        logger.debug("connected to server: " + server)
     except Exception as e:
         logger.error("Error:" + str(e))
-        exit(1)
+        sys.exit(1)
 
     vms=api.vms.list(max=100)
 
@@ -114,12 +173,12 @@ def main(args):
                 logger.info("Adding snapshot for: " + vm_.name )
                 snapshot = vm.snapshots.add(params.Snapshot(description=_SNAPSHOT_NAME))
                 logger.debug("snapshot: " + snapshot.get_id())
-                # vms_to_commit.append(VMSnapshot(vm, snapshot))
                 vms_to_commit.append({'vm': vm, 'snapshot': snapshot})
                 logger.debug("Added snapshot for vm: " + vm_.name)
         except Exception as e:
             logger.error("Error:" + str(e))
 
+    diskimgs_to_del = []
     for vm_to_commit in vms_to_commit:
         try:
             # Get the VM
@@ -132,6 +191,13 @@ def main(args):
                 if snapshot is not None:
                     if snapshot.get_snapshot_status() == 'ok':
                         logger.info("Snapshot created for VM :" + vm.name)
+                        # get the overlay image id to delete at slave
+                        overlaydisks = vm.disks.list()
+                        for disk in overlaydisks:
+                            logger.debug("DISK:" + disk.get_id())
+                            dskImage = disk.get_image_id()
+                            logger.debug("DISK IMAGE:" + dskImage)
+                            diskimgs_to_del.append(dskImage)
                         break
                     else:
                         logger.debug ("Snapshot status: " + snapshot.get_snapshot_status())
@@ -151,16 +217,27 @@ def main(args):
     if ret != 0:
         logger.error("Error:" + str(out) + ":" + '.'.join(err))
         retcode = 1
+    else:
+        # delete overlay images from slave
+        with glustermount(args.slave, args.slavevol) as mnt:
+            # find overlay image path (returns .lease and .meta files too)
+            for diskImg in diskimgs_to_del:
+                imgPaths = findImgPaths(diskImg, mnt)
+                for imgPath in imgPaths:
+                    logger.debug("IMG PATH:" + imgPath)
+                    os.remove(imgPath)
 
     for vm_to_commit in vms_to_commit:
         # Block commit VMs
         try:
             vm = vm_to_commit['vm']
-            logger.info("Delete snapshot for: " + vm.name)
+            logger.debug("Deleting snapshot for: " + vm.name)
             snapshot = vm_to_commit['snapshot']
-
-            # vm.commit_snapshot() - not working  "Cannot revert to Snapshot. VM's Snapshot does not exist."
+            # live merge
             snapshot.delete()
+            # wait for snapshot deletion to complete
+            wait_for_snapshot_deletion(vm, snapshot.get_id())
+            logger.debug("Deleted snapshot {0} for vm {1}".format(snapshot.get_name(), vm.name))
         except Exception as e:
             logger.error("Error:" + str(e))
 
