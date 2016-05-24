@@ -8,32 +8,28 @@ import time
 import argparse
 import ConfigParser
 import logging
+from logging.config import fileConfig
 import subprocess
 from cpopen import CPopen
 from contextlib import contextmanager
 import tempfile
+import datetime
 
 _georepScheduleCmd = ["/usr/bin/python", "/usr/share/glusterfs/scripts/schedule_georep.py"]
 _SNAPSHOT_NAME = "GLUSTER-Geo-rep-snapshot"
-SLAVE_MOUNT_LOG_FILE = ("/var/log/glusterfs/geo-replication"
+_SLAVE_MOUNT_LOG_FILE = ("/var/log/glusterfs/geo-replication"
                           "/dr_slave.mount.log")
+_EVT_ORIGIN = "ovirt-georep-backup"
+_EVT_BACKUP_FAILED_MSG = "Failed to backup gluster volume {0} to remote site. Please check backup log {1} for details"
+_EVT_BACKUP_SUCCEEDED_MSG = "Successfully backed up gluster volume {0} to remote site. Backup completed in {1} minutes"
 
-class VMSnapshot():
-    def getVM(self):
-        return self.vm
-
-    def getSnapshot(self):
-        return self.snapshot
-
-    def __init__(self, vm, snapshot):
-       self.vm = vm
-       self.snapshot = snapshot
 
 def findImgPaths(imgid, path):
     pattern = imgid + '*'
     for root, dirs, files in os.walk(path):
         for filename in fnmatch.filter(files, pattern):
             yield os.path.join(root, filename)
+
 
 def cleanup(hostname, volname, mnt):
     """
@@ -63,7 +59,7 @@ def glustermount(hostname, volname):
     (ret, out, err) = execCmd(["/usr/sbin/glusterfs",
                              "--volfile-server", hostname,
                              "--volfile-id", volname,
-                             "-l", SLAVE_MOUNT_LOG_FILE,
+                             "-l", _SLAVE_MOUNT_LOG_FILE,
                              mnt])
     if ret != 0:
         logger.error("Unable to mount Gluster Volume "
@@ -108,6 +104,7 @@ def execCmd(command, cwd=None, data=None, raw=False,
 
     return (p.returncode, out, err)
 
+
 def parse_input():
     parser = argparse.ArgumentParser()
     parser.add_argument("mastervol", help="Master Volume Name")
@@ -130,6 +127,7 @@ def parse_input():
     args = parser.parse_args()
     return args
 
+
 def wait_for_snapshot_deletion(vm, snapshotid):
     while True:
         snapshot = vm.snapshots.get(id=snapshotid)
@@ -139,6 +137,24 @@ def wait_for_snapshot_deletion(vm, snapshotid):
         else:
             logger.error ("Snapshot deleted for VM: " + vm.name)
             break
+
+
+def add_event(ret_code, time_taken):
+    if ret_code == 0:
+        desc = _EVT_BACKUP_SUCCEEDED_MSG.format(args.mastervol, time_taken)
+        sev = "NORMAL"
+    else:
+        desc = _EVT_BACKUP_FAILED_MSG.format(args.mastervol)
+        sev = "ALERT"
+    t = datetime.datetime.now()
+    eventId = int(t.strftime("%s"))
+    event_params = params.Event(description=desc,
+                                custom_id=eventId,
+                                severity=sev,
+                                origin=_EVT_ORIGIN,
+                                cluster=api.clusters.get("Default"))
+    api.events.add(event_params)
+
 
 def main(args):
     retcode = 0
@@ -246,8 +262,9 @@ def main(args):
     time_minutes = int(time_diff / 60)
     time_seconds = time_diff % 60
 
-    logger.info("Duration: " + str(time_minutes) + ":" + str(time_seconds) + " minutes")
+    logger.info("Duration of run: " + str(time_minutes) + ":" + str(time_seconds) + " minutes")
 
+    add_event(retcode, str(time_minutes) + ":" + str(time_seconds))
     # Disconnect from the server
     api.disconnect()
     sys.exit(retcode)
@@ -262,12 +279,21 @@ def connect(url, username, password):
         debug=False
     )
 
-if __name__ == "__main__":
+
+def configure_logging():
     logger = logging.getLogger()
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
+    try:
+        fileConfig("ovirt_georep_backup_log.conf")
+    except:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    return logger
+
+
+if __name__ == "__main__":
+    logger = configure_logging()
     args = parse_input()
     main(args)
