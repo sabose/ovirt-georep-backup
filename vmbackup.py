@@ -1,34 +1,76 @@
 #!/usr/bin/python
 import ovirtsdk.api
 from ovirtsdk.xml import params
-from ovirtsdk.infrastructure import errors
+import os
+import fnmatch
 import sys
 import time
 import argparse
 import ConfigParser
 import logging
+from logging.config import fileConfig
 import subprocess
 from cpopen import CPopen
-import io
-import select
-import threading
-from StringIO import StringIO
-from weakref import proxy
+from contextlib import contextmanager
+import tempfile
+import datetime
 
 _georepScheduleCmd = ["/usr/bin/python", "/usr/share/glusterfs/scripts/schedule_georep.py"]
 _SNAPSHOT_NAME = "GLUSTER-Geo-rep-snapshot"
+_SLAVE_MOUNT_LOG_FILE = ("/var/log/glusterfs/geo-replication"
+                          "/dr_slave.mount.log")
+_EVT_ORIGIN = "ovirt-georep-backup"
+_EVT_BACKUP_FAILED_MSG = "Failed to backup gluster volume {0} to remote site. Please check backup log for details"
+_EVT_BACKUP_SUCCEEDED_MSG = "Successfully backed up gluster volume {0} to remote site. Backup completed in {1} minutes"
 
 
-class VMSnapshot():
-    def getVM(self):
-        return self.vm
+def findImgPaths(imgid, path):
+    pattern = imgid + '*'
+    for root, dirs, files in os.walk(path):
+        for filename in fnmatch.filter(files, pattern):
+            yield os.path.join(root, filename)
 
-    def getSnapshot(self):
-        return self.snapshot
 
-    def __init__(self, vm, snapshot):
-       self.vm = vm
-       self.snapshot = snapshot
+def cleanup(hostname, volname, mnt):
+    """
+    Unmount the Volume and Remove the temporary directory
+    """
+    (ret, out, err) = execCmd(["umount", mnt])
+    if ret !=0:
+        logger.error("Unable to Unmount Gluster Volume "
+            "{0}:{1}(Mounted at {2})".format(hostname, volname, mnt))
+    (ret, out, err) = execCmd(["rmdir", mnt])
+    if ret !=0:
+        logger.error("Unable to Remove temp directory "
+            "{0}".format(mnt))
+
+
+@contextmanager
+def glustermount(hostname, volname):
+    """
+    Context manager for Mounting Gluster Volume
+    Use as
+        with glustermount(HOSTNAME, VOLNAME) as MNT:
+            # Do your stuff
+    Automatically unmounts it in case of Exceptions/out of context
+    """
+    mnt = tempfile.mkdtemp(prefix="drcleanup_")
+    logger.debug("MNT:" + mnt)
+    (ret, out, err) = execCmd(["/usr/sbin/glusterfs",
+                             "--volfile-server", hostname,
+                             "--volfile-id", volname,
+                             "-l", _SLAVE_MOUNT_LOG_FILE,
+                             mnt])
+    if ret != 0:
+        logger.error("Unable to mount Gluster Volume "
+                     "{0}:{1} at {2}".format(hostname, volname, mnt))
+    if os.path.ismount(mnt):
+        yield mnt
+    else:
+        logger.info("Unable to Mount Gluster Volume "
+                     "{0}:{1}".format(hostname, volname))
+    cleanup(hostname, volname, mnt)
+
 
 def execCmd(command, cwd=None, data=None, raw=False,
             env=None, sync=True, deathSignal=0, childUmask=None):
@@ -45,7 +87,6 @@ def execCmd(command, cwd=None, data=None, raw=False,
 
     p = CPopen(command, close_fds=True, cwd=cwd, env=env,
                deathSignal=deathSignal, childUmask=childUmask)
-    # p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     (out, err) = p.communicate(data)
 
@@ -53,15 +94,16 @@ def execCmd(command, cwd=None, data=None, raw=False,
         # Prevent splitlines() from barfing later on
         out = ""
 
-    logger.info("%s: <err> = %s; <rc> = %d",
+    logger.debug("%s: <err> = %s; <rc> = %d",
                         {True: "SUCCESS", False: "FAILED"}[p.returncode == 0],
-                        repr(err), p.returncode)
+                 repr(err), p.returncode)
 
     if not raw:
         out = out.splitlines(False)
         err = err.splitlines(False)
 
     return (p.returncode, out, err)
+
 
 def parse_input():
     parser = argparse.ArgumentParser()
@@ -85,24 +127,63 @@ def parse_input():
     args = parser.parse_args()
     return args
 
+
+def wait_for_snapshot_deletion(vm, snapshotid, wait_timeout):
+    snap_del_start_time = time.time()
+    while True:
+        duration = int(time.time()) - snap_del_start_time
+        snapshot = vm.snapshots.get(id=snapshotid)
+        if snapshot is not None:
+            logger.debug ("Snapshot status: " + snapshot.get_snapshot_status())
+            time.sleep(10)
+        else:
+            logger.info ("Snapshot deleted for VM: " + vm.name)
+            break
+        if wait_timeout > 0 and duration > (wait_timeout * 60):
+            logger.error("Snapshot deletion timed out for {0}".format(snapshot.get_name()))
+            break
+
+
+def add_event(ret_code, time_taken):
+    if ret_code == 0:
+        desc = _EVT_BACKUP_SUCCEEDED_MSG.format(args.mastervol, time_taken)
+        sev = "NORMAL"
+    else:
+        desc = _EVT_BACKUP_FAILED_MSG.format(args.mastervol)
+        sev = "ALERT"
+    t = datetime.datetime.now()
+    eventId = int(t.strftime("%s"))
+    event_params = params.Event(description=desc,
+                                custom_id=eventId,
+                                severity=sev,
+                                origin=_EVT_ORIGIN,
+                                cluster=api.clusters.get("Default"))
+    api.events.add(event_params)
+
+
 def main(args):
     retcode = 0
     if (args.config):
         # Read config file
         config = ConfigParser.ConfigParser()
         config.read(args.config)
-        server = config.get('GENERAL', 'server')
-        username = config.get('GENERAL', 'user_name')
-        password = config.get('GENERAL', 'password')
+        server = config.get('connection', 'server')
+        username = config.get('connection', 'user_name')
+        password = config.get('connection', 'password')
+    if not server or not username or not password:
+        logger.error("Server credentials not provided")
+        sys.exit("Server credentials not provided")
 
     time_start = int(time.time())
     # Connect to server
     try:
         connect(server, username, password)
+        logger.debug("connected to server: " + server)
     except Exception as e:
         logger.error("Error:" + str(e))
-        exit(1)
+        sys.exit(1)
 
+    wait_timeout = config.get('snapshot', 'wait_timeout')
     vms=api.vms.list(max=100)
 
     vms_to_commit = []
@@ -114,12 +195,12 @@ def main(args):
                 logger.info("Adding snapshot for: " + vm_.name )
                 snapshot = vm.snapshots.add(params.Snapshot(description=_SNAPSHOT_NAME))
                 logger.debug("snapshot: " + snapshot.get_id())
-                # vms_to_commit.append(VMSnapshot(vm, snapshot))
                 vms_to_commit.append({'vm': vm, 'snapshot': snapshot})
                 logger.debug("Added snapshot for vm: " + vm_.name)
         except Exception as e:
             logger.error("Error:" + str(e))
 
+    diskimgs_to_del = []
     for vm_to_commit in vms_to_commit:
         try:
             # Get the VM
@@ -132,9 +213,16 @@ def main(args):
                 if snapshot is not None:
                     if snapshot.get_snapshot_status() == 'ok':
                         logger.info("Snapshot created for VM :" + vm.name)
+                        # get the overlay image id to delete at slave
+                        overlaydisks = vm.disks.list()
+                        for disk in overlaydisks:
+                            logger.debug("DISK:" + disk.get_id())
+                            dskImage = disk.get_image_id()
+                            logger.debug("DISK IMAGE:" + dskImage)
+                            diskimgs_to_del.append(dskImage)
                         break
                     else:
-                        logger.debug ("Snapshot status: " + snapshot.get_snapshot_status())
+                        logger.debug ("Waiting for snapshot creation.. status: " + snapshot.get_snapshot_status())
                         time.sleep(10)
                 else:
                     logger.error ("Snapshot not retrieved for vm: " + vm.name)
@@ -151,16 +239,27 @@ def main(args):
     if ret != 0:
         logger.error("Error:" + str(out) + ":" + '.'.join(err))
         retcode = 1
+    else:
+        # delete overlay images from slave
+        with glustermount(args.slave, args.slavevol) as mnt:
+            # find overlay image path (returns .lease and .meta files too)
+            for diskImg in diskimgs_to_del:
+                imgPaths = findImgPaths(diskImg, mnt)
+                for imgPath in imgPaths:
+                    logger.debug("IMG PATH:" + imgPath)
+                    os.remove(imgPath)
 
     for vm_to_commit in vms_to_commit:
         # Block commit VMs
         try:
             vm = vm_to_commit['vm']
-            logger.info("Delete snapshot for: " + vm.name)
+            logger.debug("Deleting snapshot for: " + vm.name)
             snapshot = vm_to_commit['snapshot']
-
-            # vm.commit_snapshot() - not working  "Cannot revert to Snapshot. VM's Snapshot does not exist."
+            # live merge
             snapshot.delete()
+            # wait for snapshot deletion to complete
+            wait_for_snapshot_deletion(vm, snapshot.get_id(), wait_timeout)
+            logger.debug("Deleted snapshot {0} for vm {1}".format(snapshot.get_name(), vm.name))
         except Exception as e:
             logger.error("Error:" + str(e))
 
@@ -169,8 +268,9 @@ def main(args):
     time_minutes = int(time_diff / 60)
     time_seconds = time_diff % 60
 
-    logger.info("Duration: " + str(time_minutes) + ":" + str(time_seconds) + " minutes")
+    logger.info("Duration of run: " + str(time_minutes) + ":" + str(time_seconds) + " minutes")
 
+    add_event(retcode, str(time_minutes) + ":" + str(time_seconds))
     # Disconnect from the server
     api.disconnect()
     sys.exit(retcode)
@@ -185,12 +285,24 @@ def connect(url, username, password):
         debug=False
     )
 
-if __name__ == "__main__":
+
+def configure_logging(configFile):
     logger = logging.getLogger()
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
+    try:
+        config = ConfigParser.ConfigParser()
+        config.read(configFile)
+        loggerConf = config.get('logging', 'logger_conf')
+        fileConfig(loggerConf)
+    except:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    return logger
+
+
+if __name__ == "__main__":
     args = parse_input()
+    logger = configure_logging(args.config)
     main(args)
