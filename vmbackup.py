@@ -20,7 +20,7 @@ _SNAPSHOT_NAME = "GLUSTER-Geo-rep-snapshot"
 _SLAVE_MOUNT_LOG_FILE = ("/var/log/glusterfs/geo-replication"
                           "/dr_slave.mount.log")
 _EVT_ORIGIN = "ovirt-georep-backup"
-_EVT_BACKUP_FAILED_MSG = "Failed to backup gluster volume {0} to remote site. Please check backup log {1} for details"
+_EVT_BACKUP_FAILED_MSG = "Failed to backup gluster volume {0} to remote site. Please check backup log for details"
 _EVT_BACKUP_SUCCEEDED_MSG = "Successfully backed up gluster volume {0} to remote site. Backup completed in {1} minutes"
 
 
@@ -128,14 +128,19 @@ def parse_input():
     return args
 
 
-def wait_for_snapshot_deletion(vm, snapshotid):
+def wait_for_snapshot_deletion(vm, snapshotid, wait_timeout):
+    snap_del_start_time = time.time()
     while True:
+        duration = int(time.time()) - snap_del_start_time
         snapshot = vm.snapshots.get(id=snapshotid)
         if snapshot is not None:
             logger.debug ("Snapshot status: " + snapshot.get_snapshot_status())
             time.sleep(10)
         else:
-            logger.error ("Snapshot deleted for VM: " + vm.name)
+            logger.info ("Snapshot deleted for VM: " + vm.name)
+            break
+        if wait_timeout > 0 and duration > (wait_timeout * 60):
+            logger.error("Snapshot deletion timed out for {0}".format(snapshot.get_name()))
             break
 
 
@@ -162,9 +167,9 @@ def main(args):
         # Read config file
         config = ConfigParser.ConfigParser()
         config.read(args.config)
-        server = config.get('GENERAL', 'server')
-        username = config.get('GENERAL', 'user_name')
-        password = config.get('GENERAL', 'password')
+        server = config.get('connection', 'server')
+        username = config.get('connection', 'user_name')
+        password = config.get('connection', 'password')
     if not server or not username or not password:
         logger.error("Server credentials not provided")
         sys.exit("Server credentials not provided")
@@ -178,6 +183,7 @@ def main(args):
         logger.error("Error:" + str(e))
         sys.exit(1)
 
+    wait_timeout = config.get('snapshot', 'wait_timeout')
     vms=api.vms.list(max=100)
 
     vms_to_commit = []
@@ -216,7 +222,7 @@ def main(args):
                             diskimgs_to_del.append(dskImage)
                         break
                     else:
-                        logger.debug ("Snapshot status: " + snapshot.get_snapshot_status())
+                        logger.debug ("Waiting for snapshot creation.. status: " + snapshot.get_snapshot_status())
                         time.sleep(10)
                 else:
                     logger.error ("Snapshot not retrieved for vm: " + vm.name)
@@ -252,7 +258,7 @@ def main(args):
             # live merge
             snapshot.delete()
             # wait for snapshot deletion to complete
-            wait_for_snapshot_deletion(vm, snapshot.get_id())
+            wait_for_snapshot_deletion(vm, snapshot.get_id(), wait_timeout)
             logger.debug("Deleted snapshot {0} for vm {1}".format(snapshot.get_name(), vm.name))
         except Exception as e:
             logger.error("Error:" + str(e))
@@ -280,10 +286,13 @@ def connect(url, username, password):
     )
 
 
-def configure_logging():
+def configure_logging(configFile):
     logger = logging.getLogger()
     try:
-        fileConfig("ovirt_georep_backup_log.conf")
+        config = ConfigParser.ConfigParser()
+        config.read(configFile)
+        loggerConf = config.get('logging', 'logger_conf')
+        fileConfig(loggerConf)
     except:
         handler = logging.StreamHandler()
         formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
@@ -294,6 +303,6 @@ def configure_logging():
 
 
 if __name__ == "__main__":
-    logger = configure_logging()
     args = parse_input()
+    logger = configure_logging(args.config)
     main(args)
